@@ -49,6 +49,13 @@
   .primary{background:var(--accent); color:#fff;}
   .primary:hover{background:var(--accent-dark);}
   .hint{font-size:.78rem; color:var(--muted); line-height:1.4; margin-top:-.4rem;}
+  .divider{border:none; border-top:1px solid var(--panel-border); margin:.3rem 0;}
+  .import-row{display:flex; gap:.5rem; align-items:stretch;}
+  .import-row input[type="text"]{flex:1;}
+  .import-row button{background:var(--accent); color:#fff; padding:.6rem .9rem; font-size:.8rem; white-space:nowrap;}
+  .import-row button:hover{background:var(--accent-dark);}
+  input[type="file"]{font-size:.82rem; padding:.5rem;}
+  #importStatus{font-size:.78rem; color:var(--accent-dark); font-weight:600; min-height:1.1em;}
   .stage{display:flex; align-items:center; justify-content:center; padding:3rem 2rem;}
   .book{
     position:relative; border-radius:4px;
@@ -67,6 +74,18 @@
   <aside class="panel">
     <h1>Front<em>ispiece</em></h1>
     <p class="tagline">The illustrated page facing your title page. Describe the fic, get a cover.</p>
+
+    <label>Import from
+      <div class="import-row">
+        <input type="file" id="epubInput" accept=".epub">
+      </div>
+      <div class="import-row">
+        <input type="text" id="ao3Input" placeholder="https://archiveofourown.org/works/12345">
+        <button id="ao3Btn" type="button">Fetch</button>
+      </div>
+    </label>
+    <div id="importStatus"></div>
+    <hr class="divider">
 
     <label>Title
       <input id="titleInput" type="text" placeholder="the weight of what remains" maxlength="120">
@@ -107,6 +126,7 @@
   </main>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script>
 (function(){
   const W = 1200, H = 1800;
@@ -120,6 +140,16 @@
   const badge = document.getElementById('badge');
   const shuffleBtn = document.getElementById('shuffleBtn');
   const downloadBtn = document.getElementById('downloadBtn');
+  const epubInput = document.getElementById('epubInput');
+  const ao3Input = document.getElementById('ao3Input');
+  const ao3Btn = document.getElementById('ao3Btn');
+  const importStatus = document.getElementById('importStatus');
+
+  function setStatus(msg){ importStatus.textContent = msg; }
+  function stripHtml(html){
+    const d = document.createElement('div'); d.innerHTML = html || '';
+    return d.textContent.trim();
+  }
 
   // ---------- seeded random ----------
   function hashStr(s){
@@ -494,6 +524,92 @@
     link.download = slug + '-cover.png';
     link.href = canvas.toDataURL('image/png');
     link.click();
+  });
+
+  // ---------- import: epub ----------
+  epubInput.addEventListener('change', async (e)=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    setStatus('Reading epub…');
+    try{
+      const buf = await file.arrayBuffer();
+      const zip = await JSZip.loadAsync(buf);
+      const containerFile = zip.file('META-INF/container.xml');
+      if(!containerFile) throw new Error('no container.xml');
+      const containerXml = await containerFile.async('string');
+      const containerDoc = new DOMParser().parseFromString(containerXml, 'application/xml');
+      const rootfile = containerDoc.getElementsByTagName('rootfile')[0];
+      const opfPath = rootfile.getAttribute('full-path');
+      const opfFile = zip.file(opfPath);
+      if(!opfFile) throw new Error('no opf file');
+      const opfText = await opfFile.async('string');
+      const opfDoc = new DOMParser().parseFromString(opfText, 'application/xml');
+      const getDC = tag => Array.from(opfDoc.getElementsByTagNameNS('http://purl.org/dc/elements/1.1/', tag))
+        .map(el=>el.textContent.trim()).filter(Boolean);
+
+      const title = getDC('title')[0] || '';
+      const creator = getDC('creator')[0] || '';
+      const description = stripHtml(getDC('description')[0] || '');
+      const subjects = getDC('subject');
+
+      if(title) titleInput.value = title;
+      if(creator) authorInput.value = creator;
+      summaryInput.value = [description, subjects.length ? 'Tags: ' + subjects.join(', ') : '']
+        .filter(Boolean).join('\n\n');
+
+      setStatus('✓ Imported from ' + file.name);
+      render();
+    } catch(err){
+      setStatus("Couldn't read that file — make sure it's a valid .epub.");
+    }
+  });
+
+  // ---------- import: AO3 link ----------
+  async function fetchAO3(url){
+    setStatus('Fetching from AO3…');
+    const attempts = [
+      u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+      u => 'https://corsproxy.io/?' + encodeURIComponent(u)
+    ];
+    for(const buildProxyUrl of attempts){
+      try{
+        const res = await fetch(buildProxyUrl(url));
+        if(!res.ok) continue;
+        const html = await res.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+
+        const titleEl = doc.querySelector('h2.title.heading');
+        const authorEls = doc.querySelectorAll('a[rel="author"]');
+        const summaryEl = doc.querySelector('.summary.module blockquote.userstuff')
+          || doc.querySelector('.preface .summary blockquote.userstuff');
+        const tagEls = doc.querySelectorAll('dl.tags dd a.tag');
+
+        if(!titleEl && !summaryEl && tagEls.length === 0) continue;
+
+        const title = titleEl ? titleEl.textContent.trim() : '';
+        const author = Array.from(authorEls).map(a=>a.textContent.trim()).join(', ');
+        const summary = summaryEl ? summaryEl.textContent.trim() : '';
+        const tags = Array.from(tagEls).map(a=>a.textContent.trim());
+
+        if(title) titleInput.value = title;
+        if(author) authorInput.value = author;
+        summaryInput.value = [summary, tags.length ? 'Tags: ' + tags.join(', ') : '']
+          .filter(Boolean).join('\n\n');
+
+        setStatus('✓ Imported from AO3');
+        render();
+        return;
+      } catch(err){ /* try next proxy */ }
+    }
+    setStatus("Couldn't auto-fetch that link — paste the summary in manually instead.");
+  }
+  ao3Btn.addEventListener('click', ()=>{
+    const url = ao3Input.value.trim();
+    if(!url){ setStatus('Paste an AO3 work link first.'); return; }
+    fetchAO3(url);
+  });
+  ao3Input.addEventListener('keydown', e=>{
+    if(e.key === 'Enter'){ e.preventDefault(); ao3Btn.click(); }
   });
 
   // seed sample content so the tool isn't blank on load
